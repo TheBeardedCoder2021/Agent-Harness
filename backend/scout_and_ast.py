@@ -91,9 +91,9 @@ Model notes
 Scout swarm
 -----------
 * ``await run_scout_swarm(user_prompt, repo_path, router, mode="full")`` runs scouts A - D
-  concurrently (``asyncio.gather``) on ``gemini-3-8-flash`` at medium effort and always
-  returns four ``ScoutBrief`` objects in that order. ``mode="fast"`` allows one read round
-  and a smaller outline.
+  concurrently (``asyncio.gather``) on ``gemini-4-hydrogen`` - medium effort for scouts A - C,
+  high effort for scout D (failure hypotheses) - and always returns four ``ScoutBrief``
+  objects in that order. ``mode="fast"`` allows one read round and a smaller outline.
 * The router has no tool calling, so the tool loop is application-level: every scout turn
   is one ``router.call`` whose ``ScoutTurn`` answer is either a list of slice requests or
   the final brief. The harness serves the requests through
@@ -113,7 +113,7 @@ Scout swarm
   The operator's task text stays outside the delimiters. Files the slice reader refuses by
   name are withheld from the outline too, and the outline goes through ``redact_secrets``.
 * Prompts are composed to stay ``SCOUT_FLASH_HEADROOM_TOKENS`` below the router's
-  ``FLASH_PROMPT_TOKEN_CAP`` for any repository, measured conservatively (characters or
+  ``HYDROGEN_PROMPT_TOKEN_CAP`` for any repository, measured conservatively (characters or
   UTF-8 bytes, whichever counts more tokens): the outline is rendered to a token budget, the
   slices of the latest round are shortened to fit when they must be, and the oldest slice
   results a scout has already seen are dropped first (the prompt says so).
@@ -171,9 +171,9 @@ from pydantic import (
 )
 
 from backend.models_router import (
-    FLASH_PROMPT_TOKEN_CAP,
     GEMINI_CLI_INSTRUCTION,
-    MODEL_GEMINI_FLASH,
+    HYDROGEN_PROMPT_TOKEN_CAP,
+    MODEL_GEMINI_HYDROGEN,
     Effort,
     ModelRouter,
     ModelUnavailableError,
@@ -9131,8 +9131,10 @@ class ScoutBrief(BaseModel):
 # Scout swarm: limits
 # --------------------------------------------------------------------------------------
 
-SCOUT_MODEL = MODEL_GEMINI_FLASH
-SCOUT_EFFORT: Effort = "medium"
+SCOUT_MODEL = MODEL_GEMINI_HYDROGEN
+SCOUT_EFFORT: Effort = "medium"  # scouts A - C, and any scout without an entry below
+# Scout D (failure hypotheses) weighs root causes, races and traps: it gets the deeper setting.
+SCOUT_EFFORT_BY_ID: dict[ScoutId, Effort] = {"D": "high"}
 SCOUT_MODES: tuple[str, ...] = ("full", "fast")
 
 MAX_TOOL_ROUNDS = 4  # read rounds per scout: the default and the hard maximum
@@ -9169,14 +9171,15 @@ _PATH_PRESCAN_FACTOR = 2
 # would match inside ordinary words and the absolute-path pattern covers them anyway.
 _MIN_SCRUB_ROOT_CHARS = 4
 
-# Prompt budget. The router refuses a gemini-3-8-flash call above FLASH_PROMPT_TOKEN_CAP
-# (static context + prompt + schema JSON + CLI instruction); every scout call is composed to
-# stay SCOUT_FLASH_HEADROOM_TOKENS below it whatever the repository or the slices contain.
+# Prompt budget. The router refuses a gemini-4-hydrogen call above HYDROGEN_PROMPT_TOKEN_CAP
+# (static context + prompt + schema JSON + CLI instruction) unless allow_long_context is set,
+# which the swarm never does; every scout call is composed to stay SCOUT_FLASH_HEADROOM_TOKENS
+# below it whatever the repository or the slices contain.
 # The router estimates 3.5 characters per token, which undercounts CJK text and emoji (about
 # one token per character), so the swarm budgets with the larger of that estimate and
 # UTF-8 bytes / SCOUT_BYTES_PER_TOKEN.
 SCOUT_FLASH_HEADROOM_TOKENS = 6_000
-SCOUT_PROMPT_TOKEN_BUDGET = FLASH_PROMPT_TOKEN_CAP - SCOUT_FLASH_HEADROOM_TOKENS
+SCOUT_PROMPT_TOKEN_BUDGET = HYDROGEN_PROMPT_TOKEN_CAP - SCOUT_FLASH_HEADROOM_TOKENS
 SCOUT_BYTES_PER_TOKEN = 4.0
 SCOUT_OUTLINE_TOKENS_FULL = 16_000
 SCOUT_OUTLINE_TOKENS_FAST = 6_000
@@ -10493,7 +10496,7 @@ class _SwarmContext:
 
 
 def _router_prompt_tokens(static: Sequence[str], prompt: str) -> int:
-    """Token estimate of one structured gemini-3-8-flash call, as the swarm budgets it.
+    """Token estimate of one structured gemini-4-hydrogen call, as the swarm budgets it.
 
     Covers exactly what the router's pre-flight measures (static context + prompt + schema
     JSON + CLI instruction) and is never below the router's own estimate of it.
@@ -10890,14 +10893,15 @@ def _execute_requests(reader: RepoSliceReader, requests: Sequence[ScoutSliceRequ
     return fresh, notices
 
 
-async def _call_scout(ctx: _SwarmContext, static: Sequence[str], prompt: str) -> ScoutTurn:
+async def _call_scout(ctx: _SwarmContext, static: Sequence[str], prompt: str,
+                      effort: Effort = SCOUT_EFFORT) -> ScoutTurn:
     raw: object
     if ctx.timeout_s is None:
         raw = await ctx.router.call(SCOUT_MODEL, prompt, response_schema=ScoutTurn,
-                                    effort=SCOUT_EFFORT, static_context=static)
+                                    effort=effort, static_context=static)
     else:
         raw = await ctx.router.call(SCOUT_MODEL, prompt, response_schema=ScoutTurn,
-                                    effort=SCOUT_EFFORT, static_context=static,
+                                    effort=effort, static_context=static,
                                     timeout_s=ctx.timeout_s)
     return _coerce_turn(raw)
 
@@ -10916,6 +10920,7 @@ def _degraded_error(exc: Exception, reader: RepoSliceReader) -> str:
 async def _run_scout(spec: ScoutSpec, ctx: _SwarmContext) -> ScoutBrief:
     """One scout: at most ``max_rounds`` read rounds, hence at most ``max_rounds + 1`` calls."""
     static = (_scout_instructions(spec, ctx.max_rounds), ctx.outline_block)
+    effort = SCOUT_EFFORT_BY_ID.get(spec.scout_id, SCOUT_EFFORT)
     state = _ScoutState()
     paths = _PathChecker(ctx.reader, ctx.index)
     error: str | None = None
@@ -10923,7 +10928,7 @@ async def _run_scout(spec: ScoutSpec, ctx: _SwarmContext) -> ScoutBrief:
         while True:
             final = state.rounds_used >= ctx.max_rounds
             prompt = _render_scout_prompt(ctx, static, state, final=final)
-            turn = await _call_scout(ctx, static, prompt)
+            turn = await _call_scout(ctx, static, prompt, effort)
             state.calls += 1
             state.last_turn = turn
             notes = _brief_text(turn.notes, MAX_SCOUT_NOTES_CHARS)
@@ -10958,8 +10963,9 @@ async def run_scout_swarm(
     """Investigate ``repo_path`` for ``user_prompt`` with four concurrent read-only scouts.
 
     Returns exactly four validated briefs ordered A, B, C, D (entrypoints, domain / data,
-    tests, failure hypotheses). Each scout talks to ``gemini-3-8-flash`` at medium effort
-    through ``router.call``; a scout turn either asks for file slices, which the harness
+    tests, failure hypotheses). Each scout talks to ``gemini-4-hydrogen`` through
+    ``router.call`` - at medium effort for scouts A - C and high effort for scout D
+    (``SCOUT_EFFORT_BY_ID``); a scout turn either asks for file slices, which the harness
     serves through ``RepoSliceReader.read_repo_slice``, or delivers the brief.
 
     * ``mode``: ``"full"`` allows ``MAX_TOOL_ROUNDS`` read rounds and the full outline budget,
@@ -11100,6 +11106,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "SCOUT_BYTES_PER_TOKEN",
     "SCOUT_EFFORT",
+    "SCOUT_EFFORT_BY_ID",
     "SCOUT_EVIDENCE_TOKENS",
     "SCOUT_FLASH_HEADROOM_TOKENS",
     "SCOUT_MODEL",

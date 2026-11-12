@@ -64,7 +64,8 @@ backstop for that.
 Tier 2 (warm loopback daemon, 1,000 ms)
 ---------------------------------------
 A call that passed tier 1 and touches control flow, assertions, SQL / database calls or security
-sinks is sent to ``http://127.0.0.1:8000/api/internal/hook-eval``. ``{"allowed": false}`` blocks
+sinks is sent to ``http://127.0.0.1:8000/api/internal/hook-eval`` for semantic drift evaluation on
+``gemini-4-hydrogen`` at ``effort="low"`` (``thinking_level="LOW"``). ``{"allowed": false}`` blocks
 with the daemon's reason; an unreachable daemon, a timeout or a malformed answer block as well.
 """
 
@@ -93,6 +94,8 @@ HOOK: Final = "pre_tool_guard"
 DAEMON_HOST: Final = "127.0.0.1"
 DAEMON_PORT: Final = 8000
 HOOK_EVAL_ENDPOINT: Final = "/api/internal/hook-eval"
+TIER2_MODEL: Final = "gemini-4-hydrogen"
+TIER2_EFFORT: Final = "low"
 AMENDMENT_ENDPOINT: Final = "/api/internal/amendment-request"
 TOKEN_HEADER: Final = "X-Harness-Hook-Token"
 DAEMON_TIMEOUT_S: Final = 1.0
@@ -1801,6 +1804,8 @@ def _tier2(ctx: Ctx, tool_name: str, snippet: str) -> None:
         "snippet": snippet[:SNIPPET_LIMIT],
         "invariants": ctx.invariants,
         "forbidden_patterns": ctx.forbidden_patterns,
+        "model": TIER2_MODEL,
+        "effort": TIER2_EFFORT,
     }
     try:
         status, verdict = _post_json(HOOK_EVAL_ENDPOINT, body)

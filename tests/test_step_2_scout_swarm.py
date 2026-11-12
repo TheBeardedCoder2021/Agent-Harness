@@ -40,7 +40,7 @@ import backend.scout_and_ast as scout
 from backend.models_router import (
     FLASH_PROMPT_TOKEN_CAP,
     GEMINI_CLI_INSTRUCTION,
-    MODEL_GEMINI_FLASH,
+    MODEL_GEMINI_HYDROGEN,
     BudgetExceededError,
     ConfigurationError,
     FlashTokenCliffError,
@@ -72,6 +72,7 @@ from backend.scout_and_ast import (
     MAX_TOOL_ROUNDS,
     MAX_USER_PROMPT_CHARS,
     SCOUT_EFFORT,
+    SCOUT_EFFORT_BY_ID,
     SCOUT_MODEL,
     SCOUT_OUTLINE_TOKENS_FAST,
     SCOUT_OUTLINE_TOKENS_FULL,
@@ -999,7 +1000,7 @@ def test_scout_lenses_match_the_product_spec() -> None:
     assert "root causes, race conditions, or architectural traps" in focus["D"]
 
 
-def test_every_call_uses_flash_medium_effort_and_the_turn_schema(tmp_path: Path) -> None:
+def test_every_call_uses_hydrogen_with_per_scout_effort_and_the_turn_schema(tmp_path: Path) -> None:
     root = _repo(tmp_path)
 
     def script(call: Call) -> ScoutTurn:
@@ -1008,10 +1009,12 @@ def test_every_call_uses_flash_medium_effort_and_the_turn_schema(tmp_path: Path)
     router = FakeRouter(script)
     _swarm("Why do orders fail?", root, router)
     assert len(router.calls) == 8
-    assert SCOUT_MODEL == MODEL_GEMINI_FLASH == "gemini-3-8-flash" and SCOUT_EFFORT == "medium"
+    assert SCOUT_MODEL == MODEL_GEMINI_HYDROGEN == "gemini-4-hydrogen" and SCOUT_EFFORT == "medium"
+    assert SCOUT_EFFORT_BY_ID == {"D": "high"}  # scouts A - C stay on SCOUT_EFFORT
     outlines = set()
     for call in router.calls:
-        assert call.model == "gemini-3-8-flash" and call.effort == "medium"
+        assert call.model == "gemini-4-hydrogen"
+        assert call.effort == ("high" if call.scout == "D" else "medium")  # D: failure hypotheses
         assert call.response_schema is ScoutTurn and call.extra == {}
         assert len(call.static_context) == 2
         instructions, outline = call.static_context
@@ -1364,11 +1367,11 @@ def test_notes_are_carried_between_turns_and_bounded(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "error",
     [
-        ProviderError("Gemini CLI failed (gemini-3-8-flash): exit=1"),
+        ProviderError("Gemini CLI failed (gemini-4-hydrogen): exit=1"),
         TransientError("Gemini CLI transient failure: 503 overloaded"),
-        StructuredOutputError("gemini-3-8-flash output failed ScoutTurn validation"),
+        StructuredOutputError("gemini-4-hydrogen output failed ScoutTurn validation"),
         SubscriptionQuotaError("Gemini subscription quota: 429 RESOURCE_EXHAUSTED"),
-        ModelUnavailableError("gemini-3-8-flash unavailable: 404"),
+        ModelUnavailableError("gemini-4-hydrogen unavailable: 404"),
     ],
     ids=lambda e: type(e).__name__,
 )
@@ -1545,7 +1548,7 @@ def _envelope(turn: Mapping[str, Any], stdin: str, fenced: bool = False) -> str:
         body = f"```json\n{body}\n```"
     return json.dumps({
         "response": body,
-        "stats": {"models": {MODEL_GEMINI_FLASH: {"tokens": {
+        "stats": {"models": {MODEL_GEMINI_HYDROGEN: {"tokens": {
             "prompt": router_estimate_tokens(stdin), "cached": 0, "candidates": 200, "thoughts": 50,
         }}}},
     })
@@ -1677,11 +1680,11 @@ def test_end_to_end_through_the_real_model_router(tmp_path: Path) -> None:
         assert brief.hypotheses[0].suspect_files == ["src/models/order.py"]
         assert brief.confidence == 0.75 and brief.tool_rounds_used == 1
         assert brief.slices_read == ["src/app.py:1-11"]  # the .env request was refused
-    # every call went to gemini-3-8-flash through the Gemini CLI path with the schema embedded
+    # every call went to gemini-4-hydrogen through the Gemini CLI path with the schema embedded
     assert len(seen_argv) == 8
     for argv, stdin in zip(seen_argv, seen_stdin, strict=True):
         assert argv[:3] == ["gemini", "-p", GEMINI_CLI_INSTRUCTION]
-        assert argv[argv.index("-m") + 1] == "gemini-3-8-flash"
+        assert argv[argv.index("-m") + 1] == "gemini-4-hydrogen"
         assert argv[argv.index("--approval-mode") + 1] == "plan"
         assert stdin.rstrip().endswith(json.dumps(ScoutTurn.model_json_schema()))
         assert stdin.startswith("You are Scout ") and "Why does create_order lose the payload?" in stdin
@@ -1692,13 +1695,16 @@ def test_end_to_end_through_the_real_model_router(tmp_path: Path) -> None:
     assert len(second_turns) == 4
     assert all("read refused: name matches a secret-material rule" in s for s in second_turns)
     assert all("5| def create_order(payload: dict) -> Order:" in s for s in second_turns)
-    # ledger and telemetry: subscription route, no metered spend, medium effort
+    # ledger and telemetry: subscription route, no metered spend, medium effort for scouts A - C
+    # (3 scouts x 2 calls) and high effort for scout D (2 calls)
     assert ledger["calls"] == 8 and ledger["spent_usd"] == 0.0
-    assert set(ledger["by_model"]) == {"gemini-3-8-flash"}
-    assert all(r["effort"] == "medium" and r["billing_route"] == "subscription_oauth"
-               for r in ledger["records"])
+    assert set(ledger["by_model"]) == {"gemini-4-hydrogen"}
+    assert all(r["billing_route"] == "subscription_oauth" for r in ledger["records"])
+    efforts = sorted(r["effort"] for r in ledger["records"])
+    assert efforts == ["high"] * 2 + ["medium"] * 6
     started = [e for e in telemetry if e["type"] == "call_started"]
-    assert len(started) == 8 and all(e["model"] == "gemini-3-8-flash" for e in started)
+    assert len(started) == 8 and all(e["model"] == "gemini-4-hydrogen" for e in started)
+    assert sorted(e["effort"] for e in started) == efforts
 
 
 def test_end_to_end_degraded_scout_after_router_retries(tmp_path: Path) -> None:

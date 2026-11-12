@@ -60,7 +60,7 @@ from backend.scout_and_ast import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-FLASH_PROMPT_TOKEN_CAP = 90_000  # the scout swarm's hard prompt cap for gemini-3-8-flash
+FLASH_PROMPT_TOKEN_CAP = 90_000  # the scout swarm's hard prompt cap for gemini-4-hydrogen
 
 
 # ======================================================================================

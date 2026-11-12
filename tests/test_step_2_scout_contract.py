@@ -7,7 +7,7 @@ Covers the 6 DevSecOps Pre-Commit Audit Gates:
    across both `scout_and_ast` and `contract_compiler`).
 2. Polyglot Parser Resilience Gate (`PolyglotRepoIndexer` symbol & edge indexing across Python,
    PHP 8.3, JS/TS, and SQL, graceful handling of malformed syntax & binary NUL files, and 90,000-
-   token Flash guard so `gemini-3-8-flash` never triggers `FlashTokenCliffError`).
+   token soft guard so `gemini-4-hydrogen` never triggers `HydrogenPromptCapError`).
 3. Contract Invariant & Verification Command Gate (`TaskContract` Pydantic validator rejecting
    `editable_files` / `readonly_files` overlap, locking test files when `allow_test_edits=False`,
    and allowlisting `verification_commands` against arbitrary shell injection).
@@ -20,7 +20,8 @@ Covers the 6 DevSecOps Pre-Commit Audit Gates:
 5. Automated Unit & Regression Test Gate (end-to-end deterministic pre-commit suite).
 6. Step 1 Cache-Read Rate Parity Gate (`CLAUDE_VIRTUAL_PRICING` cache-read rates of `$0.20/MTok`
    for `claude-opus-5-5`, `$0.10/MTok` for `claude-sonnet-5-5`, and `$0.20/MTok` for
-   `claude-fable-5-2`).
+   `claude-fable-5-2`; `VERTEX_PRICING` flat `$1.50` / `$0.075` / `$7.50` per MTok for
+   `gemini-4-hydrogen`, shared by its `gemini-3-8-flash` alias).
 
 No test invokes a live LLM CLI or external network endpoint.
 """
@@ -61,11 +62,15 @@ from backend.models_router import (
     MODEL_CLAUDE_SONNET,
     MODEL_GEMINI_CARBON,
     MODEL_GEMINI_FLASH,
+    MODEL_GEMINI_HYDROGEN,
+    VERTEX_PRICING,
     ModelRouter,
     SubscriptionQuotaError,
 )
 from backend.scout_and_ast import (
     EXTRACTOR_SKIPPED,
+    SCOUT_EFFORT_BY_ID,
+    SCOUT_MODEL,
     SCOUT_PROMPT_TOKEN_BUDGET,
     UNTRUSTED_TAG,
     FileRecord,
@@ -549,7 +554,7 @@ def test_gate2_polyglot_resilience_on_malformed_syntax_and_binary_files(tmp_path
 def test_gate2_ast_summary_and_scout_swarm_stay_under_90k_flash_token_guard(
     tmp_path: Path,
 ) -> None:
-    """Verify AST summary and scout swarm prompts stay strictly below the 90,000-token Flash cap."""
+    """Verify AST summary and scout swarm prompts stay strictly below the 90,000-token soft guard."""
     # Build a synthetic multi-hundred-file index whose raw JSON exceeds 90,000 tokens
     records: list[FileRecord] = []
     for idx in range(450):
@@ -605,6 +610,7 @@ def test_gate2_ast_summary_and_scout_swarm_stay_under_90k_flash_token_guard(
     ) -> tuple[int, str, str]:
         observed_tokens.append(mr.estimate_tokens(stdin))
         assert mr.estimate_tokens(stdin) <= FLASH_PROMPT_TOKEN_CAP
+        assert argv[argv.index("-m") + 1] == MODEL_GEMINI_HYDROGEN
         turn_json = {
             "done": True,
             "summary": "Inspected handler_0_0 safely under the 90K Flash token guard.",
@@ -622,7 +628,7 @@ def test_gate2_ast_summary_and_scout_swarm_stay_under_90k_flash_token_guard(
             "open_questions": [],
             "confidence": 0.9,
         }
-        envelope = {"response": json.dumps(turn_json), "stats": {"models": {MODEL_GEMINI_FLASH: {}}}}
+        envelope = {"response": json.dumps(turn_json), "stats": {"models": {MODEL_GEMINI_HYDROGEN: {}}}}
         return 0, json.dumps(envelope), ""
 
     router._run_subprocess = fake_gemini_cli  # type: ignore[assignment]
@@ -633,6 +639,11 @@ def test_gate2_ast_summary_and_scout_swarm_stay_under_90k_flash_token_guard(
     assert len(briefs) == 4
     assert all(not b.degraded for b in briefs)
     assert observed_tokens and max(observed_tokens) < FLASH_PROMPT_TOKEN_CAP
+    # scouts A - C ran at medium effort, scout D (failure hypotheses) at high; one call each here
+    assert SCOUT_EFFORT_BY_ID == {"D": "high"}
+    ledger = router.get_ledger_summary()
+    assert set(ledger["by_model"]) == {MODEL_GEMINI_HYDROGEN}
+    assert sorted(rec["effort"] for rec in ledger["records"]) == ["high", "medium", "medium", "medium"]
 
 
 # ======================================================================================
@@ -1065,3 +1076,14 @@ def test_gate6_virtual_cache_read_rates_match_spec() -> None:
     assert CLAUDE_VIRTUAL_PRICING[MODEL_CLAUDE_OPUS].cached == pytest.approx(0.20)
     assert CLAUDE_VIRTUAL_PRICING[MODEL_CLAUDE_SONNET].cached == pytest.approx(0.10)
     assert CLAUDE_VIRTUAL_PRICING[MODEL_CLAUDE_FABLE].cached == pytest.approx(0.20)
+
+
+def test_gate6_hydrogen_rates_match_spec_and_the_flash_alias_shares_them() -> None:
+    """Confirm the scouts' model is priced flat at $1.50 input / $0.075 cached / $7.50 output."""
+    assert SCOUT_MODEL == MODEL_GEMINI_HYDROGEN == "gemini-4-hydrogen"
+    rate = VERTEX_PRICING[MODEL_GEMINI_HYDROGEN]
+    assert (rate.input, rate.cached, rate.output) == (1.50, 0.075, 7.50)
+    assert VERTEX_PRICING[MODEL_GEMINI_FLASH] == rate  # "gemini-3-8-flash" is an alias
+    assert mr.compute_cost(rate, 1_000_000, 0, 0) == pytest.approx(1.50)
+    assert mr.compute_cost(rate, 0, 1_000_000, 0) == pytest.approx(0.075)
+    assert mr.compute_cost(rate, 0, 0, 1_000_000) == pytest.approx(7.50)

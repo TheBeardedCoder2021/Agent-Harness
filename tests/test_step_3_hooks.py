@@ -864,3 +864,137 @@ def test_vector5_amendment_request_protocol(tmp_path: Path) -> None:
     )
     assert proc.returncode == 2
     assert "contains a NUL byte" in proc.stderr
+
+
+def test_pre_tool_guard_tier2_sends_hydrogen_low_and_fails_closed(tmp_path: Path) -> None:
+    """Verify Tier 2 exports/sends gemini-4-hydrogen at effort=low and fails closed."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    import hooks.pre_tool_guard as pre_guard
+
+    assert pre_guard.TIER2_MODEL == "gemini-4-hydrogen"
+    assert pre_guard.TIER2_EFFORT == "low"
+
+    repo, state, _ = _init_repo(tmp_path)
+    received: list[dict[str, Any]] = []
+    verdict_box: dict[str, Any] = {"allowed": True}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length)
+            received.append({"path": self.path, "body": json.loads(raw.decode("utf-8"))})
+            resp = json.dumps(verdict_box).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def _invoke(daemon_port: int) -> subprocess.CompletedProcess:
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": "src/billing/ledger.py",
+                "old_string": "return 100",
+                "new_string": "if True:\n        assert True\n    return 100",
+            },
+            "cwd": str(repo),
+            "session_id": "test-session",
+            "tool_use_id": "tool-tier2",
+        }
+        env = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+        env["HARNESS_WORKTREE_ROOT"] = str(repo)
+        env["HARNESS_STATE_DIR"] = str(state)
+        env["HARNESS_HOOK_TOKEN"] = "auditor-secret-token"
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+        runner = (
+            "import hooks.pre_tool_guard as g; "
+            f"g.DAEMON_PORT = {daemon_port}; "
+            "raise SystemExit(g.main())"
+        )
+        return subprocess.run(
+            [sys.executable, "-c", runner],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=str(repo),
+            env=env,
+            check=False,
+        )
+
+    try:
+        # 1. {"allowed": true} -> exits 0 and sends model/effort
+        res_ok = _invoke(port)
+        assert res_ok.returncode == 0, res_ok.stderr
+        assert len(received) == 1
+        assert received[0]["path"] == "/api/internal/hook-eval"
+        assert received[0]["body"]["model"] == "gemini-4-hydrogen"
+        assert received[0]["body"]["effort"] == "low"
+
+        # 2. {"allowed": false} -> fails closed (exit 2)
+        verdict_box["allowed"] = False
+        verdict_box["reason"] = "assertion weakening"
+        res_deny = _invoke(port)
+        assert res_deny.returncode == 2
+        assert "assertion weakening" in res_deny.stderr
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    # 3. Unreachable daemon -> fails closed (exit 2)
+    res_down = _invoke(port)
+    assert res_down.returncode == 2
+
+
+def test_post_tool_compactor_records_hydrogen_low_and_fails_closed(tmp_path: Path) -> None:
+    """Verify PostToolCompactor records compaction_model/effort and fails closed on tamper/bad JSON."""
+    import hooks.post_tool_compactor as post_compactor
+
+    assert post_compactor.COMPACTION_MODEL == "gemini-4-hydrogen"
+    assert post_compactor.COMPACTION_EFFORT == "low"
+
+    repo, state, _ = _init_repo(tmp_path)
+
+    # 1. Valid turn -> epoch_events.jsonl includes compaction_model & compaction_effort
+    res = run_post(repo, state, "Bash", {"command": "pytest -q"})
+    assert res.returncode == 0, res.stderr
+    events_lines = (state / "epoch_events.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(events_lines) == 1
+    record = json.loads(events_lines[0])
+    assert record["compaction_model"] == "gemini-4-hydrogen"
+    assert record["compaction_effort"] == "low"
+
+    # 2. Invalid JSON payload -> fails closed (exit 2)
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+    env["HARNESS_WORKTREE_ROOT"] = str(repo)
+    env["HARNESS_STATE_DIR"] = str(state)
+    env["HARNESS_HOOK_TOKEN"] = "auditor-secret-token"
+    env["PYTHONPATH"] = str(repo)
+    bad_json = subprocess.run(
+        [sys.executable, "-I", str(POST_COMPACTOR_PATH)],
+        input="{not-valid-json",
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=str(repo),
+        env=env,
+        check=False,
+    )
+    assert bad_json.returncode == 2
+
+    # 3. Readonly manifest tamper -> fails closed (exit 2)
+    (repo / "tests" / "test_ledger.py").write_text("def test_ledger():\n    assert False\n", encoding="utf-8")
+    tamper = run_post(repo, state, "Bash", {"command": "echo tamper"})
+    assert tamper.returncode == 2
+

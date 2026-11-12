@@ -16,6 +16,8 @@ After every tool call this hook
 3. appends one compact record to ``<state_dir>/epoch_events.jsonl`` and increments
    ``turn_count`` in ``<state_dir>/turn_state.json``. Output of more than 80 lines is written in
    full to ``<worktree>/.harness/logs/turn_<n>.log``; the record keeps the first and last 40 lines.
+   Downstream semantic log compaction targets ``gemini-4-hydrogen`` at ``effort="low"``
+   (``thinking_level="LOW"``).
 
 Register it for ``PostToolUse`` AND ``PostToolUseFailure``: a Bash command that exits non-zero
 fires only the latter, so a mutating command could otherwise skip verification by failing.
@@ -74,6 +76,8 @@ HOOK: Final = "post_tool_compactor"
 DAEMON_HOST: Final = "127.0.0.1"
 DAEMON_PORT: Final = 8000
 TAMPER_ENDPOINT: Final = "/api/internal/tamper-alert"
+COMPACTION_MODEL: Final = "gemini-4-hydrogen"
+COMPACTION_EFFORT: Final = "low"
 TOKEN_HEADER: Final = "X-Harness-Hook-Token"
 DAEMON_TIMEOUT_S: Final = 1.0
 
@@ -714,6 +718,8 @@ def _record_event(
             "duration_ms": payload.get("duration_ms"),
             "integrity": integrity,
             "tamper_alert": alert,
+            "compaction_model": COMPACTION_MODEL,
+            "compaction_effort": COMPACTION_EFFORT,
         }
         line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8", "replace")
         with open(state_dir / EVENTS_FILENAME, "ab") as handle:

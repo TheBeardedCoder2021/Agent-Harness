@@ -4,20 +4,27 @@ Routing summary
 ---------------
 * Claude (opus-5-5, sonnet-5-5, fable-5-2): always ``claude -p`` over the Claude Code
   subscription OAuth session. Actual API cost is $0.00; a *virtual* quota equivalent is tracked.
-* Gemini (4-carbon, 4-argon, 3-8-flash):
+* Gemini (4-hydrogen, 4-carbon, 4-argon; ``gemini-3-8-flash`` is an alias of 4-hydrogen):
     Tier 1  ``gemini -p`` (Google subscription OAuth, $0.00) with the prompt piped via stdin.
     Tier 2  Vertex AI through the google-genai SDK (metered USD, counted against the budget).
   Tier 1 -> Tier 2 failover happens on quota errors (429 / RESOURCE_EXHAUSTED / Quota exceeded),
   tracked per model with a 300 s cooldown, or when ``route="vertex"`` is requested explicitly.
   gemini-4-carbon additionally falls back to gemini-4-argon on 404 / 403 / 429.
+  gemini-4-hydrogen is the primary fast model: flat Vertex rates ($1.50 input / $0.075 implicit
+  cached / $7.50 output per MTok), no long-context price step.
 
 Notes
 -----
 * The Gemini CLI has no thinking / temperature flags, so ``effort`` only affects the Vertex tier
-  there. Temperature is never set on any Gemini call.
-* Gemini 4 Carbon uses *implicit* context caching only (4,096-token minimum, discount applied
+  there. Temperature is never set on any Gemini call. On the Vertex tier ``thinking_level`` is
+  ALWAYS passed explicitly: gemini-4-hydrogen runs at HIGH when it is omitted. On Tier 1 the CLI
+  cannot carry it, so a subscription-tier hydrogen call runs at the model's own default (HIGH).
+* Gemini 4 uses *implicit* context caching only (4,096-token minimum, discount applied
   automatically). Explicit ``caches.create`` is never called. Put static context first in the
   prompt so the implicit cache can hit; ``static_context`` is rendered ahead of ``prompt``.
+* gemini-4-hydrogen has a *soft* prompt guard at ``HYDROGEN_PROMPT_TOKEN_CAP`` (90K estimated
+  tokens): ``HydrogenPromptCapError`` (``FlashTokenCliffError``) is raised before anything is
+  spawned or billed unless the caller passes ``allow_long_context=True``.
 * ``claude -p`` manages its own prompt-cache breakpoints and does not accept ``cache_control``;
   ``build_cache_control_blocks`` is provided for direct Anthropic Messages API callers.
 """
@@ -56,12 +63,21 @@ TelemetryCallback = Callable[[dict[str, Any]], Awaitable[None]]
 MODEL_CLAUDE_OPUS = "claude-opus-5-5"
 MODEL_CLAUDE_SONNET = "claude-sonnet-5-5"
 MODEL_CLAUDE_FABLE = "claude-fable-5-2"
+MODEL_GEMINI_HYDROGEN = "gemini-4-hydrogen"  # primary fast model
 MODEL_GEMINI_CARBON = "gemini-4-carbon"
 MODEL_GEMINI_ARGON = "gemini-4-argon"
-MODEL_GEMINI_FLASH = "gemini-3-8-flash"
+MODEL_GEMINI_FLASH = "gemini-3-8-flash"  # backward-compatible alias of MODEL_GEMINI_HYDROGEN
 
-FLASH_PROMPT_TOKEN_CAP = 90_000  # stay clear of the 100K 5x pricing cliff
-STRUCTURED_MAX_OUTPUT_TOKENS = 16_384  # caps verbose thinking traces on JSON calls
+# Backward-compatible model ids -> canonical id. Resolved on entry to every public call, so the
+# ledger, cooldowns and CLI / Vertex requests only ever see the canonical name.
+MODEL_ALIASES: dict[str, str] = {MODEL_GEMINI_FLASH: MODEL_GEMINI_HYDROGEN}
+
+HYDROGEN_PROMPT_TOKEN_CAP = 90_000  # soft guard (allow_long_context=True overrides it)
+FLASH_PROMPT_TOKEN_CAP = HYDROGEN_PROMPT_TOKEN_CAP  # backward-compatible name
+STRUCTURED_MAX_OUTPUT_TOKENS = 16_384  # default structured JSON cap for low/medium effort
+STRUCTURED_HIGH_MAX_OUTPUT_TOKENS = 32_768  # structured JSON cap for high/xhigh/max effort
+FOREGROUND_MAX_OUTPUT_TOKENS = 65_536  # hard foreground cap on max_output_tokens
+GEMINI_CONTEXT_LIMIT_TOKENS = 1_048_576  # unified 1M context window limit (prompt + output)
 GEMINI_SUB_COOLDOWN_S = 300.0
 CHARS_PER_TOKEN = 3.5  # deliberately conservative heuristic (code/diffs tokenize densely)
 VALID_EFFORTS: frozenset[str] = frozenset({"low", "medium", "high", "xhigh", "max"})
@@ -78,6 +94,19 @@ GEMINI_THINKING_LEVEL: dict[str, str] = {
     "xhigh": "HIGH",
     "max": "HIGH",
 }
+# gemini-4-hydrogen has a level above HIGH, so the two top efforts use it instead of clamping.
+HYDROGEN_THINKING_LEVEL: dict[str, str] = {**GEMINI_THINKING_LEVEL, "xhigh": "XHIGH", "max": "XHIGH"}
+
+
+def resolve_model(model: str) -> str:
+    """The canonical model id for ``model`` (``gemini-3-8-flash`` -> ``gemini-4-hydrogen``)."""
+    return MODEL_ALIASES.get(model, model)
+
+
+def thinking_level_for(model: str, effort: str) -> str:
+    """The ``thinking_level`` sent for ``model`` at ``effort``; never omitted, never MINIMAL."""
+    table = HYDROGEN_THINKING_LEVEL if resolve_model(model) == MODEL_GEMINI_HYDROGEN else GEMINI_THINKING_LEVEL
+    return table[effort]
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,16 +126,19 @@ CLAUDE_VIRTUAL_PRICING: dict[str, Pricing] = {
 }
 
 # Vertex AI metered rates. Also used as the virtual-equivalent for Gemini subscription calls.
+HYDROGEN_PRICING = Pricing(1.50, 0.075, 7.50)  # flat: no long-context price step
 VERTEX_PRICING: dict[str, Pricing] = {
+    MODEL_GEMINI_HYDROGEN: HYDROGEN_PRICING,
     MODEL_GEMINI_CARBON: Pricing(2.00, 0.10, 10.00),
     MODEL_GEMINI_ARGON: Pricing(2.50, 0.25, 12.00),
-    MODEL_GEMINI_FLASH: Pricing(0.75, 0.075, 3.75),
+    MODEL_GEMINI_FLASH: HYDROGEN_PRICING,  # alias: same model, same rates
 }
 
 GEMINI_FALLBACK_CHAIN: dict[str, tuple[str, ...]] = {
+    MODEL_GEMINI_HYDROGEN: (MODEL_GEMINI_HYDROGEN,),
     MODEL_GEMINI_CARBON: (MODEL_GEMINI_CARBON, MODEL_GEMINI_ARGON),
     MODEL_GEMINI_ARGON: (MODEL_GEMINI_ARGON,),
-    MODEL_GEMINI_FLASH: (MODEL_GEMINI_FLASH,),
+    MODEL_GEMINI_FLASH: (MODEL_GEMINI_HYDROGEN,),
 }
 
 # --------------------------------------------------------------------------------------
@@ -160,7 +192,9 @@ class BudgetExceededError(ModelRouterError):
 
 
 class FlashTokenCliffError(ModelRouterError):
-    def __init__(self, estimated_tokens: int | str = 0, limit: int = FLASH_PROMPT_TOKEN_CAP) -> None:
+    """Soft prompt-size guard of gemini-4-hydrogen; ``allow_long_context=True`` overrides it."""
+
+    def __init__(self, estimated_tokens: int | str = 0, limit: int = HYDROGEN_PROMPT_TOKEN_CAP) -> None:
         if isinstance(estimated_tokens, str) and not _is_number(estimated_tokens):
             self.estimated_tokens = 0
             self.limit = limit
@@ -170,9 +204,12 @@ class FlashTokenCliffError(ModelRouterError):
             self.limit = limit
             self.estimated_tokens = tok
             super().__init__(
-                f"{MODEL_GEMINI_FLASH} prompt is ~{tok:,} tokens; hard guard is "
-                f"{limit:,} (the 100K pricing cliff is 5x). Trim the input or use another model."
+                f"{MODEL_GEMINI_HYDROGEN} prompt is ~{tok:,} tokens; soft guard is "
+                f"{limit:,}. Trim the input, or pass allow_long_context=True to override."
             )
+
+
+HydrogenPromptCapError = FlashTokenCliffError  # the same class under its new name
 
 
 class StructuredOutputError(ModelRouterError):
@@ -430,6 +467,7 @@ class RouterRequest:
     static_context: Sequence[str] = ()
     route: RouteChoice = "auto"
     max_output_tokens: int | None = None
+    allow_long_context: bool = False
 
 
 @dataclass(slots=True)
@@ -519,6 +557,7 @@ class ModelRouter:
         route: RouteChoice = ...,
         max_output_tokens: int | None = ...,
         timeout_s: float | None = ...,
+        allow_long_context: bool = ...,
     ) -> T: ...
 
     @overload
@@ -533,6 +572,7 @@ class ModelRouter:
         route: RouteChoice = ...,
         max_output_tokens: int | None = ...,
         timeout_s: float | None = ...,
+        allow_long_context: bool = ...,
     ) -> str: ...
 
     async def call(self, model: str, prompt: str, **kwargs: Any) -> Any:
@@ -553,6 +593,7 @@ class ModelRouter:
         timeout_s: float | None = None,
         system_instruction: str | None = None,
         system_prompt: str | None = None,
+        allow_long_context: bool = False,
         **kwargs: Any,
     ) -> Any:
         """Flexible downstream interface matching agent-harness execution semantics."""
@@ -587,6 +628,7 @@ class ModelRouter:
             route=route,
             max_output_tokens=max_output_tokens,
             timeout_s=timeout_s,
+            allow_long_context=allow_long_context,
         )
 
     async def call_detailed(
@@ -600,19 +642,23 @@ class ModelRouter:
         route: RouteChoice = "auto",
         max_output_tokens: int | None = None,
         timeout_s: float | None = None,
+        allow_long_context: bool = False,
     ) -> RouterResult[Any]:
         if model not in CLAUDE_VIRTUAL_PRICING and model not in VERTEX_PRICING:
             raise UnsupportedModelError(f"Unsupported model: {model!r}")
+        requested_model = model
+        model = resolve_model(model)
         if effort not in VALID_EFFORTS:
             raise ValueError(f"Invalid effort {effort!r}; expected one of {sorted(VALID_EFFORTS)}")
         if route not in ("auto", "subscription", "vertex"):
             raise ValueError(f"Invalid route {route!r}")
         if model in CLAUDE_VIRTUAL_PRICING and route == "vertex":
             raise ValueError("Claude models have no Vertex route")
+        self._validate_max_output_tokens(max_output_tokens)
 
         ctx = _Ctx(
             call_id=uuid.uuid4().hex[:12],
-            requested_model=model,
+            requested_model=requested_model,
             effort=effort,
             route=route,
             schema=response_schema,
@@ -621,15 +667,15 @@ class ModelRouter:
             timeout_s=timeout_s or self.timeout_s,
         )
 
-        # Pre-flight guards: nothing is spawned or billed if either trips.
-        if model == MODEL_GEMINI_FLASH:
-            est = estimate_tokens(
-                ctx.prompt
-                + self._schema_json(response_schema)
-                + (GEMINI_CLI_INSTRUCTION if response_schema is not None else "")
+        # Pre-flight guards: nothing is spawned or billed if any trips.
+        if model in VERTEX_PRICING:
+            self._check_gemini_context_limit(ctx.prompt, response_schema)
+        if model == MODEL_GEMINI_HYDROGEN:
+            self._check_prompt_cap(
+                ctx.prompt,
+                response_schema,
+                allow_long_context=allow_long_context,
             )
-            if est > FLASH_PROMPT_TOKEN_CAP:
-                raise FlashTokenCliffError(est)
 
         # Concurrency & Budget Gate: check and reserve worst-case spend under self._lock
         # before emitting telemetry or starting any network / subprocess operations.
@@ -639,6 +685,7 @@ class ModelRouter:
                 ctx.prompt + self._schema_json(response_schema),
                 response_schema,
                 max_output_tokens,
+                effort=effort,
             )
             await self._set_reservation(ctx, est_usd)
         else:
@@ -679,26 +726,27 @@ class ModelRouter:
         """Estimate worst-case metered spend for a batch and raise if it cannot fit."""
         total = 0.0
         for req in requests:
-            if req.model == MODEL_GEMINI_FLASH:
-                rendered = self._render_prompt(req.static_context, req.prompt)
-                est = estimate_tokens(
-                    rendered
-                    + self._schema_json(req.response_schema)
-                    + (GEMINI_CLI_INSTRUCTION if req.response_schema is not None else "")
-                )
-                if est > FLASH_PROMPT_TOKEN_CAP:
-                    raise FlashTokenCliffError(est)
-            if req.model in CLAUDE_VIRTUAL_PRICING:
+            self._validate_max_output_tokens(req.max_output_tokens)
+            canonical_model = resolve_model(req.model)
+            if canonical_model in CLAUDE_VIRTUAL_PRICING:
                 continue
-            if req.model not in VERTEX_PRICING:
+            if canonical_model not in VERTEX_PRICING:
                 raise UnsupportedModelError(f"Unsupported model: {req.model!r}")
-            if self._expects_vertex(req.model, req.route):
-                rendered = self._render_prompt(req.static_context, req.prompt)
+            rendered = self._render_prompt(req.static_context, req.prompt)
+            self._check_gemini_context_limit(rendered, req.response_schema)
+            if canonical_model == MODEL_GEMINI_HYDROGEN:
+                self._check_prompt_cap(
+                    rendered,
+                    req.response_schema,
+                    allow_long_context=req.allow_long_context,
+                )
+            if self._expects_vertex(canonical_model, req.route):
                 total += self._estimate_vertex_cost(
-                    req.model,
+                    canonical_model,
                     rendered + self._schema_json(req.response_schema),
                     req.response_schema,
                     req.max_output_tokens,
+                    effort=req.effort,
                 )
         async with self._lock:
             if self._spent_usd >= self.max_budget_usd or (
@@ -723,6 +771,7 @@ class ModelRouter:
                 static_context=r.static_context,
                 route=r.route,
                 max_output_tokens=r.max_output_tokens,
+                allow_long_context=r.allow_long_context,
             )
             for r in requests
         ]
@@ -764,6 +813,48 @@ class ModelRouter:
     @staticmethod
     def _schema_json(schema: type[BaseModel] | None) -> str:
         return json.dumps(schema.model_json_schema()) if schema is not None else ""
+
+    @staticmethod
+    def _validate_max_output_tokens(max_output_tokens: int | None) -> None:
+        if max_output_tokens is not None and (
+            isinstance(max_output_tokens, bool)
+            or not isinstance(max_output_tokens, int)
+            or max_output_tokens <= 0
+        ):
+            raise ValueError("max_output_tokens must be a positive integer")
+
+    def _estimate_gemini_prompt_tokens(
+        self, rendered_prompt: str, schema: type[BaseModel] | None
+    ) -> int:
+        return estimate_tokens(
+            rendered_prompt
+            + self._schema_json(schema)
+            + (GEMINI_CLI_INSTRUCTION if schema is not None else "")
+        )
+
+    def _check_gemini_context_limit(
+        self, rendered_prompt: str, schema: type[BaseModel] | None
+    ) -> None:
+        """Hard 1M context window limit across all Gemini models, regardless of allow_long_context."""
+        est = self._estimate_gemini_prompt_tokens(rendered_prompt, schema)
+        if est >= GEMINI_CONTEXT_LIMIT_TOKENS:
+            raise HydrogenPromptCapError(est, limit=GEMINI_CONTEXT_LIMIT_TOKENS)
+
+    def _check_prompt_cap(
+        self, rendered_prompt: str, schema: type[BaseModel] | None, *, allow_long_context: bool
+    ) -> None:
+        """Soft gemini-4-hydrogen guard on the estimated prompt size (what the CLI would be sent)."""
+        est = self._estimate_gemini_prompt_tokens(rendered_prompt, schema)
+        if est <= HYDROGEN_PROMPT_TOKEN_CAP:
+            return
+        if not allow_long_context:
+            raise FlashTokenCliffError(est)
+        logger.warning(
+            "%s prompt is ~%s tokens, above the soft guard of %s; allow_long_context=True",
+            MODEL_GEMINI_HYDROGEN,
+            f"{est:,}",
+            f"{HYDROGEN_PROMPT_TOKEN_CAP:,}",
+        )
 
     # ---- ledger / budget -------------------------------------------------------------------
 
@@ -846,16 +937,43 @@ class ModelRouter:
         )
 
     def _estimate_vertex_cost(
-        self, model: str, text: str, schema: type[BaseModel] | None, max_out: int | None
+        self,
+        model: str,
+        text: str,
+        schema: type[BaseModel] | None,
+        max_out: int | None,
+        *,
+        effort: str = "medium",
     ) -> float:
-        out_cap = self._effective_max_output(schema, max_out) or STRUCTURED_MAX_OUTPUT_TOKENS
-        return compute_cost(VERTEX_PRICING[model], estimate_tokens(text), 0, out_cap)
+        prompt_tokens = estimate_tokens(text)
+        out_cap = (
+            self._effective_max_output(
+                schema, max_out, effort=effort, prompt_tokens=prompt_tokens
+            )
+            or STRUCTURED_MAX_OUTPUT_TOKENS
+        )
+        return compute_cost(VERTEX_PRICING[model], prompt_tokens, 0, out_cap)
 
     @staticmethod
-    def _effective_max_output(schema: type[BaseModel] | None, requested: int | None) -> int | None:
-        if schema is not None:
-            return min(requested or STRUCTURED_MAX_OUTPUT_TOKENS, STRUCTURED_MAX_OUTPUT_TOKENS)
-        return requested
+    def _effective_max_output(
+        schema: type[BaseModel] | None,
+        requested: int | None,
+        effort: str = "medium",
+        prompt_tokens: int = 0,
+    ) -> int | None:
+        if requested is not None:
+            out: int | None = min(requested, FOREGROUND_MAX_OUTPUT_TOKENS)
+        elif schema is not None:
+            out = (
+                STRUCTURED_HIGH_MAX_OUTPUT_TOKENS
+                if effort in ("high", "xhigh", "max")
+                else STRUCTURED_MAX_OUTPUT_TOKENS
+            )
+        else:
+            out = None
+        if out is not None and prompt_tokens > 0:
+            out = min(out, max(1, GEMINI_CONTEXT_LIMIT_TOKENS - prompt_tokens))
+        return out
 
     # ---- telemetry -------------------------------------------------------------------------
 
@@ -1021,7 +1139,7 @@ class ModelRouter:
     # ---- Gemini ----------------------------------------------------------------------------
 
     def _sub_exhausted(self, model: str) -> bool:
-        return time.monotonic() < self._gemini_sub_exhausted_until.get(model, 0.0)
+        return time.monotonic() < self._gemini_sub_exhausted_until.get(resolve_model(model), 0.0)
 
     def _expects_vertex(self, model: str, route: RouteChoice) -> bool:
         if route == "vertex":
@@ -1183,7 +1301,7 @@ class ModelRouter:
             self._vertex_clients[location] = self._vertex_client_factory(location)
         return self._vertex_clients[location]
 
-    def _vertex_config(self, ctx: _Ctx) -> Any:
+    def _vertex_config(self, ctx: _Ctx, model: str | None = None) -> Any:
         try:
             from google.genai import types
         except ImportError:
@@ -1202,14 +1320,38 @@ class ModelRouter:
                 )
             else:
                 raise ConfigurationError("google-genai is not installed") from None
-        kwargs: dict[str, Any] = {
-            # Single-field ThinkingConfig; never MINIMAL; temperature is deliberately left unset.
-            "thinking_config": types.ThinkingConfig(
-                thinking_level=GEMINI_THINKING_LEVEL[ctx.effort]
-            ),
-        }
-        max_out = self._effective_max_output(ctx.schema, ctx.max_output_tokens) or (
-            STRUCTURED_MAX_OUTPUT_TOKENS if ctx.schema is not None else None
+        level = thinking_level_for(model or ctx.requested_model, ctx.effort)
+        thinking_level_enum = getattr(types, "ThinkingLevel", None)
+        if thinking_level_enum is not None:
+            if level == "XHIGH":
+                if not hasattr(thinking_level_enum, "XHIGH"):
+                    logger.warning(
+                        "google-genai ThinkingLevel lacks XHIGH; falling back to ThinkingLevel.HIGH"
+                    )
+                    resolved_level = thinking_level_enum.HIGH
+                else:
+                    resolved_level = getattr(thinking_level_enum, "XHIGH")
+            else:
+                resolved_level = getattr(thinking_level_enum, level, level)
+        else:
+            resolved_level = level
+        try:
+            # Single-field ThinkingConfig; always explicit (hydrogen defaults to HIGH when it is
+            # omitted); never MINIMAL; temperature is deliberately left unset.
+            thinking_config = types.ThinkingConfig(thinking_level=resolved_level)
+        except ValueError:  # an SDK whose enum predates XHIGH: HIGH is what omission would give
+            if level != "XHIGH":
+                raise
+            logger.warning("google-genai rejected thinking_level=XHIGH; sending HIGH instead")
+            fallback_level = thinking_level_enum.HIGH if thinking_level_enum is not None else "HIGH"
+            thinking_config = types.ThinkingConfig(thinking_level=fallback_level)
+        kwargs: dict[str, Any] = {"thinking_config": thinking_config}
+        prompt_tokens = estimate_tokens(ctx.prompt + self._schema_json(ctx.schema))
+        max_out = self._effective_max_output(
+            ctx.schema,
+            ctx.max_output_tokens,
+            effort=ctx.effort,
+            prompt_tokens=prompt_tokens,
         )
         if max_out:
             kwargs["max_output_tokens"] = max_out
@@ -1222,11 +1364,15 @@ class ModelRouter:
         await self._set_reservation(
             ctx,
             self._estimate_vertex_cost(
-                model, ctx.prompt + self._schema_json(ctx.schema), ctx.schema, ctx.max_output_tokens
+                model,
+                ctx.prompt + self._schema_json(ctx.schema),
+                ctx.schema,
+                ctx.max_output_tokens,
+                effort=ctx.effort,
             ),
         )
         client = self._vertex_client(model)
-        config = self._vertex_config(ctx)
+        config = self._vertex_config(ctx, model)
         try:
             # Implicit caching only: no caches.create on any model.
             resp = await asyncio.wait_for(
@@ -1295,18 +1441,26 @@ class ModelRouter:
 __all__ = [
     "CLAUDE_VIRTUAL_PRICING",
     "FLASH_PROMPT_TOKEN_CAP",
+    "FOREGROUND_MAX_OUTPUT_TOKENS",
+    "GEMINI_CONTEXT_LIMIT_TOKENS",
     "GEMINI_SUB_COOLDOWN_S",
+    "HYDROGEN_PROMPT_TOKEN_CAP",
+    "STRUCTURED_HIGH_MAX_OUTPUT_TOKENS",
+    "STRUCTURED_MAX_OUTPUT_TOKENS",
+    "MODEL_ALIASES",
     "MODEL_CLAUDE_FABLE",
     "MODEL_CLAUDE_OPUS",
     "MODEL_CLAUDE_SONNET",
     "MODEL_GEMINI_ARGON",
     "MODEL_GEMINI_CARBON",
     "MODEL_GEMINI_FLASH",
+    "MODEL_GEMINI_HYDROGEN",
     "VERTEX_PRICING",
     "BudgetExceededError",
     "ConfigurationError",
     "Effort",
     "FlashTokenCliffError",
+    "HydrogenPromptCapError",
     "ModelRouter",
     "ModelRouterError",
     "ModelUnavailableError",
@@ -1327,5 +1481,7 @@ __all__ = [
     "estimate_tokens",
     "extract_json_object",
     "redact_secrets",
+    "resolve_model",
     "strip_code_fences",
+    "thinking_level_for",
 ]
