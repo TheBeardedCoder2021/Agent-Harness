@@ -24,6 +24,8 @@ from backend.models_router import (
     CLAUDE_VIRTUAL_PRICING,
     FLASH_PROMPT_TOKEN_CAP,
     GEMINI_SUB_COOLDOWN_S,
+    MODEL_CLAUDE_FABLE,
+    MODEL_CLAUDE_OPUS,
     MODEL_CLAUDE_SONNET,
     MODEL_GEMINI_ARGON,
     MODEL_GEMINI_CARBON,
@@ -576,3 +578,54 @@ def test_flexible_error_constructors() -> None:
 
     f2 = FlashTokenCliffError("Custom cliff error")
     assert "Custom cliff error" in str(f2)
+
+
+# ======================================================================================
+# Gate 6: Virtual Cache-Read Rate Parity Gate
+# ======================================================================================
+
+
+def test_claude_virtual_cache_read_rates_and_ledger_parity() -> None:
+    """Verify Claude virtual cache-read rates ($0.20 Opus, $0.10 Sonnet, $0.20 Fable) and ledger parity."""
+    assert CLAUDE_VIRTUAL_PRICING[MODEL_CLAUDE_OPUS].cached == pytest.approx(0.20)
+    assert CLAUDE_VIRTUAL_PRICING[MODEL_CLAUDE_SONNET].cached == pytest.approx(0.10)
+    assert CLAUDE_VIRTUAL_PRICING[MODEL_CLAUDE_FABLE].cached == pytest.approx(0.20)
+
+    # 1M cached tokens alone (0 uncached input, 0 output) must match the exact $/MTok rate
+    assert compute_cost(CLAUDE_VIRTUAL_PRICING[MODEL_CLAUDE_OPUS], 0, 1_000_000, 0) == pytest.approx(0.20)
+    assert compute_cost(CLAUDE_VIRTUAL_PRICING[MODEL_CLAUDE_SONNET], 0, 1_000_000, 0) == pytest.approx(0.10)
+    assert compute_cost(CLAUDE_VIRTUAL_PRICING[MODEL_CLAUDE_FABLE], 0, 1_000_000, 0) == pytest.approx(0.20)
+
+    async def _run() -> None:
+        router = ModelRouter(run_id="cache-parity")
+
+        async def mock_run_subp(
+            argv: list[str], stdin: str, env: dict[str, str], timeout: float
+        ) -> tuple[int, str, str]:
+            envelope = {
+                "result": "ok",
+                "usage": {
+                    "input_tokens": 0,
+                    "cache_read_input_tokens": 1_000_000,
+                    "output_tokens": 0,
+                },
+            }
+            return 0, json.dumps(envelope), ""
+
+        router._run_subprocess = mock_run_subp  # type: ignore[assignment]
+        with patch("backend.models_router.shutil.which", return_value="/usr/bin/claude"):
+            for model, expected_virtual in (
+                (MODEL_CLAUDE_OPUS, 0.20),
+                (MODEL_CLAUDE_SONNET, 0.10),
+                (MODEL_CLAUDE_FABLE, 0.20),
+            ):
+                await router.call(model, "Check cache parity")
+                summary = router.get_ledger_summary()
+                assert summary["spent_usd"] == 0.0
+                model_stats = summary["by_model"][model]
+                assert model_stats["cached_tokens"] == 1_000_000
+                assert model_stats["actual_usd"] == 0.0
+                assert model_stats["virtual_usd"] == pytest.approx(expected_virtual)
+
+    asyncio.run(_run())
+

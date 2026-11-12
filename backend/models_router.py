@@ -91,8 +91,8 @@ class Pricing:
 
 # Virtual quota-equivalent rates (Claude subscription; actual API cost is $0).
 CLAUDE_VIRTUAL_PRICING: dict[str, Pricing] = {
-    MODEL_CLAUDE_OPUS: Pricing(4.00, 0.40, 20.00),
-    MODEL_CLAUDE_SONNET: Pricing(2.00, 0.20, 10.00),
+    MODEL_CLAUDE_OPUS: Pricing(4.00, 0.20, 20.00),
+    MODEL_CLAUDE_SONNET: Pricing(2.00, 0.10, 10.00),
     MODEL_CLAUDE_FABLE: Pricing(8.00, 0.20, 40.00),
 }
 
@@ -209,6 +209,12 @@ _CLAUDE_STRIP = (
 _GEMINI_STRIP = ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI")
 
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"-----BEGIN (?:[A-Z0-9]+ ){0,4}PRIVATE KEY-----[^\r\n]{0,4096}-----END (?:[A-Z0-9]+ ){0,4}PRIVATE KEY-----"
+        r"|-----BEGIN (?:[A-Z0-9]+ ){0,4}PRIVATE KEY-----"
+        r"(?:[ \t]*\r?\n[ \t]*[A-Za-z0-9+/=_-]{8,}(?:[ \t]*:[ \t]*[^\r\n]+)?){0,256}"
+        r"(?:[ \t]*\r?\n[ \t]*-----END (?:[A-Z0-9]+ ){0,4}PRIVATE KEY-----)?"
+    ),  # PEM / OpenSSH / PKCS#8 private key blocks and headers
     re.compile(r"AIza[0-9A-Za-z-_]{20,}"),  # Google API key
     re.compile(r"sk-ant-[a-zA-Z0-9_\-]{15,}"),  # Anthropic API key
     re.compile(r"sk-[a-zA-Z0-9_\-]{15,}"),  # OpenAI / generic key
