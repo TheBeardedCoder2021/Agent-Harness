@@ -1142,6 +1142,8 @@ class ModelRouter:
         return time.monotonic() < self._gemini_sub_exhausted_until.get(resolve_model(model), 0.0)
 
     def _expects_vertex(self, model: str, route: RouteChoice) -> bool:
+        if model in CLAUDE_VIRTUAL_PRICING:
+            return False
         if route == "vertex":
             return True
         if route == "subscription":
